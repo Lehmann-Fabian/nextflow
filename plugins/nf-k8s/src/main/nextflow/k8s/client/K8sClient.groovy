@@ -46,7 +46,6 @@ import nextflow.exception.ProcessFailedException
 import org.yaml.snakeyaml.Yaml
 
 import java.time.temporal.ChronoUnit
-import java.util.concurrent.TimeoutException
 import java.util.function.Predicate
 
 /**

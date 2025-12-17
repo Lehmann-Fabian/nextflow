@@ -16,8 +16,16 @@
 
 package nextflow.trace
 
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.regex.Pattern
 
 import groovy.json.StringEscapeUtils
@@ -45,6 +53,13 @@ class TraceRecord implements Serializable {
 
     // note: ?i stands for ignore case - ?m stands for multiline
     static public final Pattern SECRET_REGEX = ~/(?im)(^AWS[^=]*|.*TOKEN[^=]*|.*SECRET[^=]*)=(.*)$/
+
+    public static final ExecutorService executor = Executors.newCachedThreadPool({ Runnable r ->
+        Thread t = new Thread(r)
+        t.setDaemon(true)
+        t.name = "TraceReader-${System.nanoTime()}"
+        return t
+    } as ThreadFactory )
 
     TraceRecord() {
         this.store = new LinkedHashMap<>(FIELDS.size())
@@ -408,6 +423,41 @@ class TraceRecord implements Serializable {
         "${this.class.simpleName} ${this.store}"
     }
 
+    static List<String> readLinesWithTimeout(Path file, int timeoutSec = 5) {
+        int trial = 0
+        for (int i=0; i<7; i++) {
+            Thread workerThread
+            Future<List<String>> future = executor.submit({
+                workerThread = Thread.currentThread()
+                try(BufferedReader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+                    return reader.readLines()
+                } catch ( IOException e ) {
+                    println "Cannot read file $file: ${e.message}"
+                    return []
+                }
+            } as Callable<List<String>>)
+
+            try {
+                return future.get(timeoutSec, TimeUnit.SECONDS)
+            } catch (TimeoutException te) {
+                log.warn "Timeout reading file: $file"
+                try {
+                    if (workerThread != null) {
+                        log.warn "Forcefully stopping IO thread: ${workerThread.name}"
+                        workerThread.stop() // We have to stop the thread as future.cancel is not enough to stop a readLines
+                    }
+                } catch (Throwable t) {
+                    log.error "Error while killing thread: ${t.message}"
+                }
+                future.cancel(true)
+            } catch (Exception e) {
+                log.error "Cannot read file $file: ${e.message}"
+                return []
+            }
+            Thread.sleep(1000 * Math.pow(2, trial++) as int) // exponential backoff, wait up to 2^6 = 64 seconds
+        }
+        throw new RuntimeException("Failed to read file $file after multiple attempts")
+    }
 
     /**
      * Parse the trace file
@@ -420,51 +470,48 @@ class TraceRecord implements Serializable {
      *
      */
     TraceRecord parseTraceFile( Path file ) {
+        final lines = readLinesWithTimeout( file, 20 )
+        if( !lines )
+            return this
+        if( lines[0] != 'nextflow.trace/v2' )
+            return parseLegacy(file, lines)
 
-        try(BufferedReader reader = Files.newBufferedReader(file)) {
-            final lines = reader.readLines()
-            if( !lines )
-                return this
-            if( lines[0] != 'nextflow.trace/v2' )
-                return parseLegacy(file, lines)
+        for( int i=0; i<lines.size(); i++ ) {
+            final pair = lines[i].tokenize('=')
+            final name = pair[0]
+            final value = pair[1]
+            if( value == null )
+                continue
 
-            for( int i=0; i<lines.size(); i++ ) {
-                final pair = lines[i].tokenize('=')
-                final name = pair[0]
-                final value = pair[1]
-                if( value == null )
-                    continue
+            switch (name) {
+                case '%cpu':
+                case '%mem':
+                    // fields '%cpu' and '%mem' are expressed as percent value
+                    this.put(name, parseInt(value, file, name) / 10F)
+                    break
 
-                switch (name) {
-                    case '%cpu':
-                    case '%mem':
-                        // fields '%cpu' and '%mem' are expressed as percent value
-                        this.put(name, parseInt(value, file, name) / 10F)
-                        break
+                case 'rss':
+                case 'vmem':
+                case 'peak_rss':
+                case 'peak_vmem':
+                    // these fields are provided in KB, so they are normalized to bytes
+                    def val = parseLong(value, file, name) * 1024
+                    this.put(name, val)
+                    break
 
-                    case 'rss':
-                    case 'vmem':
-                    case 'peak_rss':
-                    case 'peak_vmem':
-                        // these fields are provided in KB, so they are normalized to bytes
-                        def val = parseLong(value, file, name) * 1024
-                        this.put(name, val)
-                        break
+                case 'cpu_model':
+                    this.put(name, value)
+                    break
 
-                    case 'cpu_model':
-                        this.put(name, value)
-                        break
-
-                    default:
-                        def val = parseLong(value, file, name)
-                        this.put(name, val)
-                        break
-                }
-
+                default:
+                    def val = parseLong(value, file, name)
+                    this.put(name, val)
+                    break
             }
 
-            return this
         }
+
+        return this
     }
 
     private TraceRecord parseLegacy( Path file, List<String> lines) {

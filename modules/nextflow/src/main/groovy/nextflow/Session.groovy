@@ -709,6 +709,7 @@ class Session implements ISession {
             // shutdown thread pools
             finalizePoolManager?.shutdownOrAbort(aborted,this)
             publishPoolManager?.shutdownOrAbort(aborted,this)
+            List<Runnable> notExecuted = TraceRecord.executor?.shutdownNow()
             // invoke shutdown callbacks
             shutdown0()
             log.trace "Session > after cleanup"
